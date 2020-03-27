@@ -5,29 +5,35 @@
 
 -- Author: megmacattack
 -- Data source: mostly http://datacrystal.romhacking.net/wiki/The_Legend_of_Zelda:RAM_map
--- This file is available under Creative Commons CC0 
+-- This file is available under Creative Commons CC0
 
 -- WARNING: May only work on first quest???
+
+-- Note:
+-- Game mode (ram addr 0x12) < 3 means we probably should not sync...
 
 local bit = require("bit")
 local math = require("math")
 
-local base_spec = require('modes.tloz_progress')
+local base_spec = require("modes.tloz_progress")
 
 local spec = {
-	guid = "377c5683-3cf5-4c56-a921-ab40257b2ec1",
+	guid = "ab3e1084-86a1-4475-bd01-8dcbf875a990",
 	format = "1.2",
 	name = "The Legend of Zelda (sync most things)",
-	match = {"stringtest", addr=0xffeb, value="ZELDA"},
-
+	match = {"stringtest", addr = 0xffeb, value = "ZELDA"},
 	sync = {},
+	startup = function(forceSend)
+		print("STARTUP FUNCTION CALLED!!!")
+	end,
+	-- running = {"test", addr = 0x12, gte = 0x3}
 }
 
 for base_key, base_val in pairs(base_spec.sync) do
 	spec.sync[base_key] = base_val
 end
 
-spec.sync[0x066E] = {kind="delta", deltaMin=0} --keys
+spec.sync[0x066E] = {kind = "delta", deltaMin = 0} --keys
 
 function pluralMessage(count, name)
 	if count == 1 then
@@ -41,55 +47,107 @@ end
 -- When we get a new container we need to add one to the number of hearts the other player gets
 -- When we lose a container we need to make sure the filled heart count isn't > containers count.
 spec.sync[0x066F] = {
-	kind=function(value, previousValue, receiving)
+	kind = function(value, previousValue, receiving)
+		local previousContainer = bit.rshift(AND(previousValue, 0xf0), 4)
+		local newContainer = bit.rshift(AND(value, 0xf0), 4)
+		print("prevContainer: " .. tostring(previousContainer) .. " newContainer: " .. tostring(newContainer))
 		if receiving then
 			-- if we're receiving we care which way the value changed, and want to
 			-- act accordingly.
-			local previousContainer = bit.rshift(AND(previousValue, 0xf0), 4)
-			local newContainer = bit.rshift(AND(value, 0xf0), 4)
 			if newContainer > previousContainer then
 				-- bump up filled hearts by number of new containers
-				value = OR(
-					AND(value, 0xf0),
-					AND(previousValue, 0x0f) + newContainer - previousContainer
-				)
+				value = OR(AND(value, 0xf0), AND(previousValue, 0x0f) + newContainer - previousContainer)
 				message("Partner gained " .. pluralMessage(newContainer - previousContainer, "Heart Container"))
-			else
+				return true, value
+			elseif (newContainer < previousContainer) then
 				-- clamp the number of filled containers to the number of
 				-- containers available
 				local currentlyFilled = AND(previousValue, 0x0f)
-				value = OR(
-					AND(value, 0xf0),
-					AND(math.min(currentlyFilled, newContainer), 0xf)
-				)
+				value = OR(AND(value, 0xf0), AND(math.min(currentlyFilled, newContainer), 0xf))
 				message("Partner lost " .. pluralMessage(previousContainer - newContainer, "Heart Container"))
+				return true, value
 			end
-			return true, value
+			return false -- Default to ignore update from partner
 		else
+			-- Prevent synchronization of less than three heart containers
+			if (newContainer < 3) then
+				return false
+			end
+
 			-- if we're sending, we just care if the container count changed.
 			return AND(value, 0xf0) ~= AND(previousValue, 0xf0), value
 		end
 	end
 }
 
- -- bomb count, but we need to adjust how many bombs you actually have after
- -- syncing (max out bombs on increase, reduce bombs on decrease)
-spec.sync[0x067C] = {kind="delta", deltaMin=1, deltaMax=255,
-	receiveTrigger=function(value, previousValue)
-		if value > previousValue then
-			-- we got an increase in bombs, set bomb count to the same thing and print out the bomb upgrade count
-			memory.writebyte(0x0658, value)
-			message("Partner got a bomb upgrade of " .. pluralMessage(value - previousValue, "bomb"))
-		else
-			-- we got a decrease in bombs so clamp our count and print out that we lost a bomb
-			local oldBombCount = memory.readbyte(0x0658)
-			if oldBombCount > value then
-				memory.writebyte(0x0658, value)
+-- bomb count, but we need to adjust how many bombs you actually have after
+-- syncing (max out bombs on increase, reduce bombs on decrease)
+	spec.sync[0x067C] = {
+		kind = function(value, previousValue, receiving)
+			-- We ignore max bomb count < 8 as that is something that only
+			-- happens during startup
+			if (receiving and value >= 8) then
+				local delta = math.abs(value - previousValue)
+
+				if (delta > 0) then 
+					if ((previousValue < value) and (value > 8)) then
+						message("Partner got a bomb upgrade of " .. pluralMessage(value - math.max(previousValue, 8), "bomb"))
+						memory.writebyte(0x0658, value)
+					elseif (value < previousValue) then
+						message("Partner chose to get rid of " .. pluralMessage(previousValue - value, "bomb"))
+						memory.writebyte(0x0658, value)					
+					end
+				end -- delta > 0
+			else -- we are sending
+				if (value < 8) then
+					-- We should never send updates of less than 8 max bombs...
+					value = 8
+				end
 			end
-			message("Partner chose to get rid of " .. pluralMessage(previousValue - value, "bomb"))
+
+			return true, value
 		end
-	end
 }
+
+-- spec.sync[0x067C] = {
+-- 	kind = "delta",
+-- 	deltaMin = 1,
+-- 	deltaMax = 255,
+-- 	receiveTrigger = function(value, previousValue, receiving)
+-- 		print("recieveTrigger " .. tostring(value) .. " " .. tostring(previousValue) .. " " .. tostring(receiving))
+-- 		print("Game status: " .. tostring(memory.readbyte(0x12)))
+
+-- 		statusMessage("Got max bomb update " .. tostring(value))
+-- 		if (value < 8) then
+-- 			-- Ignore updates if not less than 8 bombs.
+-- 			return false, 0
+-- 		end
+
+-- 		-- Only care if we are notified that we can have more than 8 bombs
+-- 		if (value >= 8) then
+-- 			-- Note: We can always carry 8 bombs so let's compensate for weirdness that causes us to first get 1 bomb slot and then 7 more when starting.
+-- 			if (value > previousValue) then
+-- 				-- we got an increase in bombs, set bomb count to the same thing and print out the bomb upgrade count
+-- 				message("Partner got a bomb upgrade of " .. pluralMessage(value - math.max(previousValue, 8), "bomb"))
+
+-- 				-- Refill bombs
+-- 				memory.writebyte(0x0658, value)
+-- 			elseif value < previousValue then
+-- 				-- we got a decrease in bombs so clamp our count and print out that we lost a bomb
+-- 				local oldBombCount = memory.readbyte(0x0658)
+-- 				if oldBombCount > value then
+-- 					memory.writebyte(0x0658, value)
+-- 				end
+-- 				message("Partner chose to get rid of " .. pluralMessage(previousValue - value, "bomb"))
+-- 			end
+-- 			-- Always write max bombs.
+-- 			memory.writebyte(0x067c, value)
+-- 		end -- if (value > 8)
+
+-- 		-- Everything is handled here, so we never want the framework to do anything
+-- 		return false, 0
+-- 	end -- function()
+-- }
 
 -- ow map open/get data is between 0x067f and 0x6fe (top left to bottom right)
 -- each tile has 0x80 set if it requires an item to open and is opened,
@@ -98,9 +156,8 @@ spec.sync[0x067C] = {kind="delta", deltaMin=1, deltaMax=255,
 
 -- comment out to not sync overworld map data
 for i = 0x067f, 0x06fe do
-	spec.sync[i] = {kind="bitOr", mask=OR(0x80,0x10)}
+	spec.sync[i] = {kind = "bitOr", mask = OR(0x80, 0x10)}
 end
-
 
 -- dungeon map data is between 0x6ff and 0x7fe (top left to bottom right, all
 -- the dungeons are in a single 2d array with each other)
@@ -119,7 +176,7 @@ end
 -- will erase the bits unless the room has a boss in it, in which case it will
 -- leave them alone and keep the boss killed.
 for i = 0x06ff, 0x07fe do
-	spec.sync[i] = {kind="bitOr"} -- including enemy kill data allows boss kills. Doesn't affect normal rooms.
+	spec.sync[i] = {kind = "bitOr"} -- including enemy kill data allows boss kills. Doesn't affect normal rooms.
 end
 
 return spec
